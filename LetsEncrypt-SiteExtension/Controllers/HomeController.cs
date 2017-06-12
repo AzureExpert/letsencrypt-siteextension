@@ -1,7 +1,7 @@
 ﻿using ARMExplorer.Controllers;
 using ARMExplorer.Modules;
-using LetsEncrypt.SiteExtension;
-using LetsEncrypt.SiteExtension.Core;
+using LetsEncrypt.Azure.Core;
+using LetsEncrypt.Azure.Core.Models;
 using LetsEncrypt.SiteExtension.Models;
 using Microsoft.Azure.Graph.RBAC;
 using Microsoft.Azure.Graph.RBAC.Models;
@@ -19,6 +19,7 @@ using System.Configuration;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Web;
 using System.Web.Mvc;
 
@@ -43,7 +44,7 @@ namespace LetsEncrypt.SiteExtension.Controllers
                     using (var client = ArmHelper.GetWebSiteManagementClient(model))
                     {
                         //Update web config.
-                        var site = client.Sites.GetSiteOrSlot(model.ResourceGroupName, model.WebAppName, model.SiteSlotName);
+                        var site = client.WebApps.GetSiteOrSlot(model.ResourceGroupName, model.WebAppName, model.SiteSlotName);
                         //Validate that the service plan resource group name is correct, to avoid more issues on this specific problem.
                         var azureServerFarmResourceGroup = site.ServerFarmResourceGroup();
                         if (!string.Equals(azureServerFarmResourceGroup, model.ServicePlanResourceGroupName, StringComparison.InvariantCultureIgnoreCase))
@@ -51,7 +52,7 @@ namespace LetsEncrypt.SiteExtension.Controllers
                             ModelState.AddModelError("ServicePlanResourceGroupName", string.Format("The Service Plan Resource Group registered on the Web App in Azure in the ServerFarmId property '{0}' does not match the value you entered here {1}", azureServerFarmResourceGroup, model.ServicePlanResourceGroupName));
                             return View(model);
                         }
-                        var webappsettings = client.Sites.ListSiteOrSlotAppSettings(model.ResourceGroupName, model.WebAppName, model.SiteSlotName);
+                        var webappsettings = client.WebApps.ListSiteOrSlotAppSettings(model.ResourceGroupName, model.WebAppName, model.SiteSlotName);
                         if (model.UpdateAppSettings)
                         {
                             var newAppSettingsValues = new Dictionary<string, string>{
@@ -76,7 +77,7 @@ namespace LetsEncrypt.SiteExtension.Controllers
                                 }
                             }
 
-                            client.Sites.UpdateSiteOrSlotAppSettings(model.ResourceGroupName, model.WebAppName, model.SiteSlotName, webappsettings);
+                            client.WebApps.UpdateSiteOrSlotAppSettings(model.ResourceGroupName, model.WebAppName, model.SiteSlotName, webappsettings);
                             ConfigurationManager.RefreshSection("appSettings");                            
                         }
                         else
@@ -146,10 +147,10 @@ namespace LetsEncrypt.SiteExtension.Controllers
             {
                 var client = ArmHelper.GetWebSiteManagementClient(settings);
 
-                var site = client.Sites.GetSiteOrSlot(settings.ResourceGroupName, settings.WebAppName, settings.SiteSlotName);               
+                var site = client.WebApps.GetSiteOrSlot(settings.ResourceGroupName, settings.WebAppName, settings.SiteSlotName);               
                 model.HostNames = site.HostNames;
                 model.HostNameSslStates = site.HostNameSslStates;
-                model.Certificates = client.Certificates.GetCertificates(settings.ServicePlanResourceGroupName).Value;
+                model.Certificates = client.Certificates.ListByResourceGroup(settings.ServicePlanResourceGroupName).ToList();
                 model.InstalledCertificateThumbprint = id;
                 if (model.HostNames.Count == 1)
                 {
@@ -187,7 +188,7 @@ namespace LetsEncrypt.SiteExtension.Controllers
             var settings = new AppSettingsAuthConfig();
             var client = ArmHelper.GetWebSiteManagementClient(settings);
 
-            var site = client.Sites.GetSiteOrSlot(settings.ResourceGroupName, settings.WebAppName, settings.SiteSlotName);
+            var site = client.WebApps.GetSiteOrSlot(settings.ResourceGroupName, settings.WebAppName, settings.SiteSlotName);
             var model = new HostnameModel();
             ViewBag.HostNames = site.HostNames.Where(s => !s.EndsWith(settings.AzureWebSitesDefaultDomainName)).Select(s => new SelectListItem()
             {
@@ -197,42 +198,34 @@ namespace LetsEncrypt.SiteExtension.Controllers
         }
 
         [HttpPost]
-        public ActionResult Install(RequestAndInstallModel model)
+        public async Task<ActionResult> Install(RequestAndInstallModel model)
         {
             if (ModelState.IsValid)
             {
                 var s = SettingsStore.Instance.Load();
-                s.Add(new LetsEncrypt.SiteExtension.Models.SettingEntry()
+                s.Add(new SettingEntry()
                 {
                     Name = "email",
                     Value = model.Email
                 });
                 var baseUri = model.UseStaging == false ? "https://acme-v01.api.letsencrypt.org/" : "https://acme-staging.api.letsencrypt.org/";
-                s.Add(new LetsEncrypt.SiteExtension.Models.SettingEntry()
+                s.Add(new SettingEntry()
                 {
                     Name = "baseUri",
                     Value = baseUri
                 });
                 SettingsStore.Instance.Save(s);
                 var settings = new AppSettingsAuthConfig();
-                var target = new Target()
-                {
-                    ClientId = settings.ClientId,
-                    ClientSecret = settings.ClientSecret,
-                    Email = model.Email,
-                    Host = model.Hostnames.First(),
-                    WebAppName = settings.WebAppName,
-                    SiteSlotName = settings.SiteSlotName,
-                    ResourceGroupName = settings.ResourceGroupName,
-                    SubscriptionId = settings.SubscriptionId,
-                    Tenant = settings.Tenant,
-                    BaseUri = baseUri,
-                    ServicePlanResourceGroupName = settings.ServicePlanResourceGroupName,
-                    AlternativeNames = model.Hostnames.Skip(1).ToList(),
-                    UseIPBasedSSL = settings.UseIPBasedSSL,
-                    DisableWebConfigUpdate = settings.DisableWebConfigUpdate
+                var target = new AcmeConfig()
+                {                    
+                    RegistrationEmail = model.Email,
+                    Host = model.Hostnames.First(),                    
+                    BaseUri = baseUri,                    
+                    AlternateNames = model.Hostnames.Skip(1).ToList(),
+                    PFXPassword = settings.PFXPassword,
+                    RSAKeyLength = settings.RSAKeyLength,    
                 };
-                var thumbprint = CertificateManager.RequestAndInstallInternal(target);
+                var thumbprint = await new CertificateManager(settings).RequestAndInstallInternalAsync(target);
                 if (thumbprint != null)
                     return RedirectToAction("Hostname", new { id = thumbprint });
             }
@@ -245,10 +238,10 @@ namespace LetsEncrypt.SiteExtension.Controllers
             var settings = new AppSettingsAuthConfig();
             using (var client = ArmHelper.GetWebSiteManagementClient(settings))
             {
-                var s = client.Sites.GetSiteOrSlot(settings.ResourceGroupName, settings.WebAppName, settings.SiteSlotName);
+                var s = client.WebApps.GetSiteOrSlot(settings.ResourceGroupName, settings.WebAppName, settings.SiteSlotName);
                 foreach (var hostname in settings.Hostnames)
                 {
-                    client.Sites.CreateOrUpdateSiteOrSlotHostNameBinding(settings.ResourceGroupName, settings.WebAppName, settings.SiteSlotName, hostname, new HostNameBinding
+                    client.WebApps.CreateOrUpdateSiteOrSlotHostNameBinding(settings.ResourceGroupName, settings.WebAppName, settings.SiteSlotName, hostname, new HostNameBinding
                     {
                         CustomHostNameDnsRecordType = CustomHostNameDnsRecordType.CName,
                         HostNameType = HostNameType.Verified,
@@ -305,7 +298,7 @@ namespace LetsEncrypt.SiteExtension.Controllers
             catch (CloudException ex)
             {
                 var s = ex.Body.Message;
-                var s2 = ex.Response.Content.AsString();
+                var s2 = ex.Response.Content;
 
             }
 
